@@ -2,4 +2,6 @@
 
 
 
-![Uploading image.png…]()
+<img width="418" height="402" alt="Screenshot 2026-02-12 161258" src="https://github.com/user-attachments/assets/df0c7d8e-520c-47d3-bc5a-dc9c63e66fbc" />
+
+
