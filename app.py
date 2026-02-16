@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-Coal Mine Safety Dashboard - Phase 1: Foundation & Basic UI
+Coal Mine Safety Dashboard - Phase 2: Real-time Data Simulation
 Sensor-Fused AI Helmet for Real-Time Coal Mine Threat Assessment
 
-Phase 1 Features:
-- Basic dashboard layout with industrial theme
-- Static gas metrics display (CO2, CH4, O2, H2S)
-- Helmet selector interface
-- Professional mining industry styling
+Phase 2 Features:
+- Real-time data simulation with 2-second updates
+- Dynamic sensor readings that change over time
+- Live gas metrics display (CO2, CH4, O2, H2S)
+- Data buffer management for continuous monitoring
+- Alert notifications when thresholds are exceeded
 """
 
 import dash
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, callback
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 import pandas as pd
+import random
+import numpy as np
+import time
+from collections import deque
 
 # Initialize Dash app with custom styling
 app = dash.Dash(
@@ -63,8 +68,26 @@ SAMPLE_HELMETS = {
     },
 }
 
-# Static gas readings for initial display
-SAMPLE_GAS_DATA = {
+# Real-time data storage and simulation parameters
+DATA_BUFFER_SIZE = 100  # Store last 100 readings per helmet
+UPDATE_INTERVAL = 2000  # 2 seconds in milliseconds
+
+# Initialize data buffers for each helmet
+real_time_data = {}
+data_timestamps = {}
+for helmet_id in SAMPLE_HELMETS.keys():
+    real_time_data[helmet_id] = {
+        "co2": deque(maxlen=DATA_BUFFER_SIZE),
+        "ch4": deque(maxlen=DATA_BUFFER_SIZE),
+        "o2": deque(maxlen=DATA_BUFFER_SIZE),
+        "h2s": deque(maxlen=DATA_BUFFER_SIZE),
+        "temp": deque(maxlen=DATA_BUFFER_SIZE),
+        "humidity": deque(maxlen=DATA_BUFFER_SIZE),
+    }
+    data_timestamps[helmet_id] = deque(maxlen=DATA_BUFFER_SIZE)
+
+# Base sensor readings for simulation (will vary around these values)
+BASE_SENSOR_DATA = {
     "HELMET_001": {
         "co2": 420,
         "ch4": 0.8,
@@ -123,6 +146,113 @@ SAMPLE_GAS_DATA = {
         "humidity": 65,
     },
 }
+
+# Sensor variation parameters for realistic simulation
+SENSOR_VARIATION = {
+    "co2": {"noise": 15, "drift": 0.02, "spike_chance": 0.05, "spike_magnitude": 100},
+    "ch4": {"noise": 0.1, "drift": 0.001, "spike_chance": 0.03, "spike_magnitude": 0.5},
+    "o2": {"noise": 0.2, "drift": 0.001, "spike_chance": 0.02, "spike_magnitude": -1.0},
+    "h2s": {"noise": 0.5, "drift": 0.01, "spike_chance": 0.04, "spike_magnitude": 5},
+    "temp": {"noise": 1.0, "drift": 0.005, "spike_chance": 0.01, "spike_magnitude": 5},
+    "humidity": {
+        "noise": 2.0,
+        "drift": 0.01,
+        "spike_chance": 0.02,
+        "spike_magnitude": 10,
+    },
+}
+
+
+def generate_realistic_sensor_reading(helmet_id, sensor_type, previous_value=None):
+    """Generate realistic sensor readings with noise, drift, and occasional spikes"""
+    base_value = BASE_SENSOR_DATA[helmet_id][sensor_type]
+    variation = SENSOR_VARIATION[sensor_type]
+
+    # If helmet is offline, return 0
+    if SAMPLE_HELMETS[helmet_id]["status"] == "OFFLINE":
+        return 0
+
+    # Start with base value if no previous reading
+    if previous_value is None:
+        current_value = base_value
+    else:
+        current_value = previous_value
+
+    # Add random noise
+    noise = random.gauss(0, variation["noise"])
+
+    # Add gradual drift
+    drift = random.gauss(0, variation["drift"] * base_value)
+
+    # Occasional spikes (simulating environmental events)
+    spike = 0
+    if random.random() < variation["spike_chance"]:
+        spike = random.gauss(0, variation["spike_magnitude"])
+
+    # Calculate new value
+    new_value = current_value + noise + drift + spike
+
+    # Apply sensor-specific constraints
+    if sensor_type == "co2":
+        new_value = max(200, min(2000, new_value))  # CO2 physical limits
+    elif sensor_type == "ch4":
+        new_value = max(0, min(5, new_value))  # CH4 percentage limits
+    elif sensor_type == "o2":
+        new_value = max(15, min(22, new_value))  # O2 percentage limits
+    elif sensor_type == "h2s":
+        new_value = max(0, min(50, new_value))  # H2S ppm limits
+    elif sensor_type == "temp":
+        new_value = max(15, min(50, new_value))  # Temperature limits
+    elif sensor_type == "humidity":
+        new_value = max(30, min(95, new_value))  # Humidity limits
+
+    return round(new_value, 2)
+
+
+def update_all_sensor_data():
+    """Update sensor data for all helmets"""
+    current_time = datetime.now()
+
+    for helmet_id in SAMPLE_HELMETS.keys():
+        # Generate new readings based on previous values
+        for sensor_type in ["co2", "ch4", "o2", "h2s", "temp", "humidity"]:
+            # Get previous value if available
+            previous_value = None
+            if len(real_time_data[helmet_id][sensor_type]) > 0:
+                previous_value = real_time_data[helmet_id][sensor_type][-1]
+
+            # Generate new reading
+            new_reading = generate_realistic_sensor_reading(
+                helmet_id, sensor_type, previous_value
+            )
+
+            # Store in buffer
+            real_time_data[helmet_id][sensor_type].append(new_reading)
+
+        # Store timestamp
+        data_timestamps[helmet_id].append(current_time)
+
+
+def get_current_readings(helmet_id):
+    """Get the most recent readings for a helmet"""
+    if helmet_id not in real_time_data or len(real_time_data[helmet_id]["co2"]) == 0:
+        # Return base data if no real-time data available
+        return BASE_SENSOR_DATA[helmet_id]
+
+    return {
+        "co2": real_time_data[helmet_id]["co2"][-1],
+        "ch4": real_time_data[helmet_id]["ch4"][-1],
+        "o2": real_time_data[helmet_id]["o2"][-1],
+        "h2s": real_time_data[helmet_id]["h2s"][-1],
+        "temp": real_time_data[helmet_id]["temp"][-1],
+        "humidity": real_time_data[helmet_id]["humidity"][-1],
+    }
+
+
+# Initialize with some initial data
+for _ in range(5):  # Generate 5 initial readings
+    update_all_sensor_data()
+    time.sleep(0.1)  # Small delay between initial readings
 
 
 def get_status_color(value, thresholds):
@@ -415,9 +545,53 @@ app.layout = html.Div(
             ],
             style={"margin": "0 20px 30px 20px"},
         ),
+        # Real-time update interval component
+        dcc.Interval(
+            id="interval-component",
+            interval=UPDATE_INTERVAL,  # Update every 2 seconds
+            n_intervals=0,
+        ),
+        # Store component for real-time data
+        dcc.Store(id="live-data-store"),
         # Main Dashboard Content
         html.Div(
             [
+                # Status indicators for real-time updates
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.I(
+                                    className="fas fa-circle",
+                                    style={"color": "#28a745", "marginRight": "8px"},
+                                ),
+                                "LIVE DATA",
+                                html.Span(
+                                    id="last-update-time",
+                                    style={
+                                        "marginLeft": "10px",
+                                        "fontSize": "12px",
+                                        "color": "#6c757d",
+                                    },
+                                ),
+                            ],
+                            style={
+                                "display": "flex",
+                                "alignItems": "center",
+                                "fontSize": "14px",
+                                "fontWeight": "bold",
+                                "color": "#2c3e50",
+                            },
+                        ),
+                    ],
+                    style={
+                        "backgroundColor": "#f8f9fa",
+                        "padding": "10px 20px",
+                        "borderRadius": "8px",
+                        "marginBottom": "20px",
+                        "border": "1px solid #dee2e6",
+                    },
+                ),
                 # Gas Metrics Section
                 html.Div(
                     [
@@ -428,6 +602,15 @@ app.layout = html.Div(
                                     style={"marginRight": "10px"},
                                 ),
                                 "Gas Level Monitoring",
+                                html.Span(
+                                    "(Live Updates Every 2s)",
+                                    style={
+                                        "fontSize": "14px",
+                                        "color": "#6c757d",
+                                        "fontWeight": "normal",
+                                        "marginLeft": "10px",
+                                    },
+                                ),
                             ],
                             style={"color": "#2c3e50", "marginBottom": "20px"},
                         ),
@@ -473,20 +656,8 @@ app.layout = html.Div(
                             id="all-helmets-display",
                             children=[
                                 html.Div(
-                                    [
-                                        create_helmet_status_card(
-                                            helmet_id,
-                                            helmet_info,
-                                            SAMPLE_GAS_DATA[helmet_id],
-                                        )
-                                        for helmet_id, helmet_info in SAMPLE_HELMETS.items()
-                                    ],
-                                    style={
-                                        "display": "grid",
-                                        "gridTemplateColumns": "repeat(auto-fit, minmax(250px, 1fr))",
-                                        "gap": "10px",
-                                        "margin": "0 10px",
-                                    },
+                                    "Loading helmet status...",
+                                    style={"textAlign": "center", "padding": "20px"},
                                 )
                             ],
                         ),
@@ -518,31 +689,90 @@ app.layout = html.Div(
 )
 
 
-# Callback for updating metrics based on selected helmet
+# Real-time data update callback
+@app.callback(
+    [Output("live-data-store", "data"), Output("last-update-time", "children")],
+    [Input("interval-component", "n_intervals")],
+)
+def update_live_data(n_intervals):
+    """Update sensor data every interval"""
+    # Generate new sensor readings
+    update_all_sensor_data()
+
+    # Get current time
+    current_time = datetime.now().strftime("%H:%M:%S")
+
+    # Prepare data for storage
+    current_data = {}
+    for helmet_id in SAMPLE_HELMETS.keys():
+        current_data[helmet_id] = get_current_readings(helmet_id)
+
+    return current_data, f"Last updated: {current_time}"
+
+
+# Callback for updating dashboard based on helmet selection and real-time data
 @app.callback(
     [
         Output("gas-metrics-display", "children"),
         Output("environmental-metrics-display", "children"),
     ],
-    [Input("helmet-selector", "value")],
+    [Input("helmet-selector", "value"), Input("live-data-store", "data")],
 )
-def update_helmet_metrics(selected_helmet):
-    if selected_helmet not in SAMPLE_GAS_DATA:
-        return "Helmet not found", "Helmet not found"
+def update_dashboard(selected_helmet, live_data):
+    """Update dashboard displays based on selected helmet and real-time data"""
+    if not selected_helmet or not live_data:
+        return [], []
 
-    data = SAMPLE_GAS_DATA[selected_helmet]
-    helmet_info = SAMPLE_HELMETS[selected_helmet]
+    # Get real-time data for selected helmet
+    data = live_data.get(selected_helmet, get_current_readings(selected_helmet))
+    helmet_info = SAMPLE_HELMETS.get(selected_helmet, {})
 
-    # Gas Metrics Cards
+    # Check for alerts
+    alerts = []
+    if data["co2"] > GAS_THRESHOLDS["co2"]["warning"]:
+        alerts.append("CO₂ Alert")
+    if data["ch4"] > GAS_THRESHOLDS["ch4"]["warning"]:
+        alerts.append("Methane Alert")
+    if data["o2"] < 19.5:
+        alerts.append("Low Oxygen Alert")
+    if data["h2s"] > GAS_THRESHOLDS["h2s"]["warning"]:
+        alerts.append("H₂S Alert")
+
+    # Gas Metrics Cards with real-time data
     gas_cards = html.Div(
         [
+            # Alert banner if any alerts
+            (
+                html.Div(
+                    [
+                        html.I(
+                            className="fas fa-exclamation-triangle",
+                            style={"marginRight": "10px", "fontSize": "18px"},
+                        ),
+                        "ALERTS: " + ", ".join(alerts),
+                    ],
+                    style={
+                        "backgroundColor": "#fff3cd",
+                        "color": "#856404",
+                        "padding": "15px",
+                        "borderRadius": "8px",
+                        "marginBottom": "20px",
+                        "border": "1px solid #ffeaa7",
+                        "fontWeight": "bold",
+                        "display": "flex",
+                        "alignItems": "center",
+                    },
+                )
+                if alerts
+                else html.Div()
+            ),
             html.Div(
                 [
                     create_metric_card(
                         "Carbon Dioxide",
                         data["co2"],
                         "ppm",
-                        "fa-cloud",
+                        "fa-smog",
                         GAS_THRESHOLDS["co2"],
                         "Safe: <500ppm",
                     ),
@@ -576,11 +806,11 @@ def update_helmet_metrics(selected_helmet):
                     "gridTemplateColumns": "repeat(auto-fit, minmax(250px, 1fr))",
                     "gap": "10px",
                 },
-            )
+            ),
         ]
     )
 
-    # Environmental Metrics Cards
+    # Environmental Metrics Cards with real-time data
     env_cards = html.Div(
         [
             html.Div(
@@ -630,10 +860,43 @@ def update_helmet_metrics(selected_helmet):
     return gas_cards, env_cards
 
 
-if __name__ == "__main__":
-    print("🚀 Starting Coal Mine Safety Dashboard - Phase 1")
-    print("📊 Features: Basic UI with gas metrics display")
-    print("🌐 Access dashboard at: http://127.0.0.1:8050")
-    print("⛑️  Monitoring 8 helmet sensors with static data")
+# Callback for updating all helmets overview
+@app.callback(
+    Output("all-helmets-display", "children"),
+    [Input("live-data-store", "data")],
+)
+def update_all_helmets_display(live_data):
+    """Update all helmets status display with real-time data"""
+    if not live_data:
+        return html.Div(
+            "Loading helmet status...", style={"textAlign": "center", "padding": "20px"}
+        )
 
-    app.run_server(debug=True, host="127.0.0.1", port=8050)
+    helmet_cards = []
+    for helmet_id, helmet_info in SAMPLE_HELMETS.items():
+        current_data = live_data.get(helmet_id, get_current_readings(helmet_id))
+        helmet_cards.append(
+            create_helmet_status_card(helmet_id, helmet_info, current_data)
+        )
+
+    return html.Div(
+        helmet_cards,
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(auto-fit, minmax(250px, 1fr))",
+            "gap": "10px",
+            "margin": "0 10px",
+        },
+    )
+
+
+if __name__ == "__main__":
+    print("🚀 Starting Coal Mine Safety Dashboard - Phase 2")
+    print("📊 Features: Real-time data simulation with live updates")
+    print("🔄 Update Interval: 2 seconds")
+    print("🌐 Access dashboard at: http://127.0.0.1:8050")
+    print("⛑️  Monitoring 8 helmet sensors with dynamic data")
+    print("🚨 Alert system: Active for threshold violations")
+    print("💾 Data Buffer: Storing last 100 readings per helmet")
+
+    app.run(debug=True, host="127.0.0.1", port=8050)
