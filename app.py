@@ -20,7 +20,10 @@ import pandas as pd
 import random
 import numpy as np
 import time
+import json
+import threading
 from collections import deque
+import paho.mqtt.client as mqtt
 
 # Initialize Dash app with custom styling
 app = dash.Dash(
@@ -72,6 +75,18 @@ SAMPLE_HELMETS = {
 DATA_BUFFER_SIZE = 100  # Store last 100 readings per helmet
 UPDATE_INTERVAL = 2000  # 2 seconds in milliseconds
 
+# MQTT Configuration for Wokwi Connection
+MQTT_BROKER = "broker.hivemq.com"  # Free MQTT broker
+MQTT_PORT = 1883
+MQTT_TOPIC = "wokwi/coalmine/sensors"  # Change this to match your Wokwi setup
+MQTT_USERNAME = None  # Add if your broker requires authentication
+MQTT_PASSWORD = None  # Add if your broker requires authentication
+
+# MQTT Connection Status
+mqtt_connected = False
+mqtt_client = None
+last_mqtt_message_time = None
+
 # Initialize data buffers for each helmet
 real_time_data = {}
 data_timestamps = {}
@@ -85,6 +100,9 @@ for helmet_id in SAMPLE_HELMETS.keys():
         "humidity": deque(maxlen=DATA_BUFFER_SIZE),
     }
     data_timestamps[helmet_id] = deque(maxlen=DATA_BUFFER_SIZE)
+
+# MQTT received data buffer
+mqtt_received_data = {}
 
 # Base sensor readings for simulation (will vary around these values)
 BASE_SENSOR_DATA = {
@@ -163,6 +181,106 @@ SENSOR_VARIATION = {
 }
 
 
+# MQTT Callback Functions
+def on_mqtt_connect(client, userdata, flags, rc):
+    """Callback for MQTT connection"""
+    global mqtt_connected
+    if rc == 0:
+        mqtt_connected = True
+        print(f"✅ Connected to MQTT broker: {MQTT_BROKER}")
+        # Subscribe to the sensor data topic
+        client.subscribe(MQTT_TOPIC)
+        client.subscribe(
+            f"{MQTT_TOPIC}/+"
+        )  # Subscribe to subtopics for individual helmets
+        print(f"📡 Subscribed to topic: {MQTT_TOPIC}")
+    else:
+        mqtt_connected = False
+        print(f"❌ Failed to connect to MQTT broker. Return code: {rc}")
+
+
+def on_mqtt_disconnect(client, userdata, rc):
+    """Callback for MQTT disconnection"""
+    global mqtt_connected
+    mqtt_connected = False
+    print(f"📡 Disconnected from MQTT broker. Return code: {rc}")
+
+
+def on_mqtt_message(client, userdata, msg):
+    """Handle incoming MQTT messages from Wokwi simulator"""
+    global mqtt_received_data, last_mqtt_message_time
+
+    try:
+        # Decode the message
+        message = msg.payload.decode("utf-8")
+        print(f"📨 Received MQTT message: {message}")
+
+        # Parse JSON data from Wokwi
+        sensor_data = json.loads(message)
+
+        # Update last message time
+        last_mqtt_message_time = datetime.now()
+
+        # Expected JSON format from Wokwi:
+        # {
+        #   "helmet_id": "HELMET_001",
+        #   "co2": 450,
+        #   "ch4": 1.2,
+        #   "o2": 20.5,
+        #   "h2s": 5,
+        #   "temp": 28.5,
+        #   "humidity": 72.3,
+        #   "timestamp": "2026-02-16T10:30:00"
+        # }
+
+        helmet_id = sensor_data.get("helmet_id", "HELMET_001")
+
+        # Store the received data
+        mqtt_received_data[helmet_id] = {
+            "co2": float(sensor_data.get("co2", 0)),
+            "ch4": float(sensor_data.get("ch4", 0)),
+            "o2": float(sensor_data.get("o2", 0)),
+            "h2s": float(sensor_data.get("h2s", 0)),
+            "temp": float(sensor_data.get("temp", 0)),
+            "humidity": float(sensor_data.get("humidity", 0)),
+        }
+
+        print(f"✅ Updated data for {helmet_id}: {mqtt_received_data[helmet_id]}")
+
+    except json.JSONDecodeError:
+        print(f"❌ Failed to parse JSON from MQTT message: {message}")
+    except Exception as e:
+        print(f"❌ Error processing MQTT message: {e}")
+
+
+def setup_mqtt_client():
+    """Initialize and setup MQTT client"""
+    global mqtt_client
+
+    try:
+        mqtt_client = mqtt.Client()
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_message = on_mqtt_message
+
+        # Set authentication if provided
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+        # Connect to broker
+        print(f"🔄 Connecting to MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+        # Start the MQTT loop in a separate thread
+        mqtt_client.loop_start()
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to setup MQTT client: {e}")
+        return False
+
+
 def generate_realistic_sensor_reading(helmet_id, sensor_type, previous_value=None):
     """Generate realistic sensor readings with noise, drift, and occasional spikes"""
     base_value = BASE_SENSOR_DATA[helmet_id][sensor_type]
@@ -210,24 +328,38 @@ def generate_realistic_sensor_reading(helmet_id, sensor_type, previous_value=Non
 
 
 def update_all_sensor_data():
-    """Update sensor data for all helmets"""
+    """Update sensor data for all helmets - use MQTT data if available, otherwise simulate"""
     current_time = datetime.now()
 
+    # Check if we have recent MQTT data (within last 10 seconds)
+    using_mqtt_data = False
+    if mqtt_connected and last_mqtt_message_time:
+        time_since_last_mqtt = (current_time - last_mqtt_message_time).total_seconds()
+        using_mqtt_data = time_since_last_mqtt <= 10
+
     for helmet_id in SAMPLE_HELMETS.keys():
-        # Generate new readings based on previous values
-        for sensor_type in ["co2", "ch4", "o2", "h2s", "temp", "humidity"]:
-            # Get previous value if available
-            previous_value = None
-            if len(real_time_data[helmet_id][sensor_type]) > 0:
-                previous_value = real_time_data[helmet_id][sensor_type][-1]
+        # Use MQTT data if available and recent
+        if using_mqtt_data and helmet_id in mqtt_received_data:
+            mqtt_data = mqtt_received_data[helmet_id]
+            # Use MQTT data directly
+            for sensor_type in ["co2", "ch4", "o2", "h2s", "temp", "humidity"]:
+                new_reading = mqtt_data.get(sensor_type, 0)
+                real_time_data[helmet_id][sensor_type].append(new_reading)
+        else:
+            # Fall back to simulation
+            for sensor_type in ["co2", "ch4", "o2", "h2s", "temp", "humidity"]:
+                # Get previous value if available
+                previous_value = None
+                if len(real_time_data[helmet_id][sensor_type]) > 0:
+                    previous_value = real_time_data[helmet_id][sensor_type][-1]
 
-            # Generate new reading
-            new_reading = generate_realistic_sensor_reading(
-                helmet_id, sensor_type, previous_value
-            )
+                # Generate new reading
+                new_reading = generate_realistic_sensor_reading(
+                    helmet_id, sensor_type, previous_value
+                )
 
-            # Store in buffer
-            real_time_data[helmet_id][sensor_type].append(new_reading)
+                # Store in buffer
+                real_time_data[helmet_id][sensor_type].append(new_reading)
 
         # Store timestamp
         data_timestamps[helmet_id].append(current_time)
@@ -249,7 +381,10 @@ def get_current_readings(helmet_id):
     }
 
 
-# Initialize with some initial data
+# Initialize with some initial data and setup MQTT
+print("🔄 Setting up MQTT connection to Wokwi simulator...")
+setup_mqtt_client()
+
 for _ in range(5):  # Generate 5 initial readings
     update_all_sensor_data()
     time.sleep(0.1)  # Small delay between initial readings
@@ -477,6 +612,20 @@ app.layout = html.Div(
                 html.Div(
                     [
                         html.I(
+                            className="fas fa-wifi",
+                            style={"fontSize": "20px", "marginRight": "10px"},
+                        ),
+                        html.Span(
+                            id="mqtt-status",
+                            children="MQTT: CONNECTING",
+                            style={"fontWeight": "bold"},
+                        ),
+                    ],
+                    style={"color": "#ffc107", "padding": "10px 20px"},
+                ),
+                html.Div(
+                    [
+                        html.I(
                             className="fas fa-clock",
                             style={"fontSize": "20px", "marginRight": "10px"},
                         ),
@@ -691,11 +840,16 @@ app.layout = html.Div(
 
 # Real-time data update callback
 @app.callback(
-    [Output("live-data-store", "data"), Output("last-update-time", "children")],
+    [
+        Output("live-data-store", "data"),
+        Output("last-update-time", "children"),
+        Output("mqtt-status", "children"),
+        Output("mqtt-status", "style"),
+    ],
     [Input("interval-component", "n_intervals")],
 )
 def update_live_data(n_intervals):
-    """Update sensor data every interval"""
+    """Update sensor data every interval and show MQTT status"""
     # Generate new sensor readings
     update_all_sensor_data()
 
@@ -707,7 +861,29 @@ def update_live_data(n_intervals):
     for helmet_id in SAMPLE_HELMETS.keys():
         current_data[helmet_id] = get_current_readings(helmet_id)
 
-    return current_data, f"Last updated: {current_time}"
+    # Determine MQTT status
+    mqtt_status_text = "MQTT: DISCONNECTED"
+    mqtt_status_style = {"fontWeight": "bold", "color": "#dc3545"}  # Red
+
+    if mqtt_connected:
+        if last_mqtt_message_time:
+            time_since_last = (datetime.now() - last_mqtt_message_time).total_seconds()
+            if time_since_last <= 10:
+                mqtt_status_text = "WOKWI: CONNECTED"
+                mqtt_status_style = {"fontWeight": "bold", "color": "#28a745"}  # Green
+            else:
+                mqtt_status_text = "WOKWI: NO DATA"
+                mqtt_status_style = {"fontWeight": "bold", "color": "#ffc107"}  # Yellow
+        else:
+            mqtt_status_text = "MQTT: WAITING"
+            mqtt_status_style = {"fontWeight": "bold", "color": "#17a2b8"}  # Blue
+
+    return (
+        current_data,
+        f"Last updated: {current_time}",
+        mqtt_status_text,
+        mqtt_status_style,
+    )
 
 
 # Callback for updating dashboard based on helmet selection and real-time data
@@ -891,12 +1067,26 @@ def update_all_helmets_display(live_data):
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Coal Mine Safety Dashboard - Phase 2")
-    print("📊 Features: Real-time data simulation with live updates")
+    print("🚀 Starting Coal Mine Safety Dashboard - Phase 3: Wokwi Integration")
+    print("📊 Features: Real-time data from Wokwi simulator + simulation fallback")
     print("🔄 Update Interval: 2 seconds")
     print("🌐 Access dashboard at: http://127.0.0.1:8050")
-    print("⛑️  Monitoring 8 helmet sensors with dynamic data")
+    print(f"📡 MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+    print(f"📋 MQTT Topic: {MQTT_TOPIC}")
+    print("⛑️  Monitoring 8 helmet sensors with MQTT + simulated data")
     print("🚨 Alert system: Active for threshold violations")
     print("💾 Data Buffer: Storing last 100 readings per helmet")
+    print("\n📝 JSON Format expected from Wokwi:")
+    print(
+        """{
+  "helmet_id": "HELMET_001",
+  "co2": 450.5,
+  "ch4": 1.2,
+  "o2": 20.5,
+  "h2s": 5.0,
+  "temp": 28.5,
+  "humidity": 72.3
+}"""
+    )
 
     app.run(debug=True, host="127.0.0.1", port=8050)
